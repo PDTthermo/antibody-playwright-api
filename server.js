@@ -247,65 +247,168 @@ app.get("/search", async (req, res) => {
 
     let rows = [];
 
-    // ------------ BIOLEGEND ------------
-    // ------------ BIOLEGEND ------------
+// ------------ BIOLEGEND ------------
 if (vendor === "biolegend") {
   try {
-    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+    // Ensure the page fully renders dynamic content
+    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
     await acceptCookies(page);
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
     await page.waitForTimeout(800);
-    await autoScroll(page, 6);
 
-    // Each product is inside <li class="row list"> with <h2><a itemprop="name">
-    const cardsSel = "li.row.list";
-    await page.waitForSelector(cardsSel, { timeout: 15000 }).catch(() => {});
-
-    // In case “Load more” exists
+    // Try to reveal lazy content
+    await autoScroll(page, 8);
     await clickLoadMoreIfAny(page, 5);
     await autoScroll(page, 2);
 
-    rows = await page.$$eval(cardsSel, (cards) => {
-      return Array.from(cards)
-        .map((card) => {
-          const a = card.querySelector("h2 a[itemprop='name'], a[itemprop='name']");
-          if (!a) return null;
+    // Candidate containers and card selectors observed on BLG
+    const containerSelectors = [
+      "ul.search-results",
+      "ul#search-results",
+      "div.search-results",
+      "div.c-search-results__products",
+      "div#search-results"
+    ];
+    const cardSelectors = [
+      "li.row.list",                             // your sample
+      "ul.search-results li",                    // common list
+      "li[data-variantid]",                      // variant rows
+      "article.c-product-card",                  // newer layout
+      ".c-product-card",                         // generic card
+      "div.product-cell"                         // older grid
+    ];
+    const titleSelectors = [
+      "h2 a[itemprop='name']",
+      "a[itemprop='name']",
+      "a.c-product-card__title",
+      "a.product-name",
+      "a.product-title",
+      "a.card-title",
+      "a[href*='/products/']"
+    ];
 
-          const name = a.textContent ? a.textContent.trim().replace(/\s+/g, " ") : null;
-          let href = a.getAttribute("href") || "";
-          if (href && !/^https?:\/\//i.test(href)) {
-            href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+    // Wait for any container to show up
+    let foundContainer = null;
+    for (const sel of containerSelectors) {
+      const ok = await page.$(sel);
+      if (ok) { foundContainer = sel; break; }
+    }
+    // Also wait for at least one card pattern
+    let foundCardSel = null;
+    for (const sel of cardSelectors) {
+      const ok = await page.$(sel);
+      if (ok) { foundCardSel = sel; break; }
+    }
+
+    // If still nothing, one more nudge + wait
+    if (!foundCardSel) {
+      await autoScroll(page, 4);
+      for (const sel of cardSelectors) {
+        const ok = await page.$(sel);
+        if (ok) { foundCardSel = sel; break; }
+      }
+    }
+
+    // Primary extraction pass: card -> title anchor
+    if (foundCardSel) {
+      rows = await page.$$eval(
+        foundCardSel,
+        (cards, titleSelectorsIn) => {
+          const all = [];
+          for (const card of cards) {
+            let a = null;
+            for (const ts of titleSelectorsIn) {
+              a = card.querySelector(ts);
+              if (a) break;
+            }
+            if (!a) continue;
+            const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+            let href = a.getAttribute("href") || "";
+            if (href && !/^https?:\/\//i.test(href)) {
+              href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+            }
+            if (!name || !/biolegend\.com/i.test(href)) continue;
+
+            // Conjugate: text before " anti-" if present; else last comma part
+            let conjugate = name;
+            const idx = name.toLowerCase().indexOf(" anti-");
+            if (idx > 0) conjugate = name.slice(0, idx).trim();
+            else {
+              const parts = name.split(",");
+              if (parts.length > 1) conjugate = parts[parts.length - 1].trim();
+            }
+
+            all.push({
+              vendor: "BioLegend",
+              product_name: name,
+              target: null,
+              species: null,
+              conjugate,
+              link: href
+            });
           }
-          if (!name || !href.includes("biolegend.com")) return null;
+          return all;
+        },
+        titleSelectors
+      );
+    }
 
-          // Extract conjugate from part before "anti-" if possible
-          let conjugate = name;
-          const idx = name.toLowerCase().indexOf(" anti-");
-          if (idx > 0) conjugate = name.slice(0, idx).trim();
-
-          return {
-            vendor: "BioLegend",
-            product_name: name,
-            target: null,
-            species: null,
-            conjugate: conjugate,
-            link: href
-          };
-        })
-        .filter(Boolean);
-    });
+    // Fallback extraction: directly query anchors under containers
+    if ((!rows || rows.length === 0) && foundContainer) {
+      rows = await page.$$eval(
+        `${foundContainer} a[itemprop='name'], ${foundContainer} a.c-product-card__title, ${foundContainer} a.product-name, ${foundContainer} a[href*='/products/']`,
+        (anchors) => {
+          const out = [];
+          for (const a of anchors) {
+            const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+            let href = a.getAttribute("href") || "";
+            if (href && !/^https?:\/\//i.test(href)) {
+              href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+            }
+            if (!name || !/biolegend\.com/i.test(href)) continue;
+            let conjugate = name;
+            const idx = name.toLowerCase().indexOf(" anti-");
+            if (idx > 0) conjugate = name.slice(0, idx).trim();
+            else {
+              const parts = name.split(",");
+              if (parts.length > 1) conjugate = parts[parts.length - 1].trim();
+            }
+            out.push({
+              vendor: "BioLegend",
+              product_name: name,
+              target: null,
+              species: null,
+              conjugate,
+              link: href
+            });
+          }
+          return out;
+        }
+      );
+    }
 
     // Fill target/species from query
-    rows = rows.map((r) => ({
-      ...r,
-      target: target,
-      species: species
-    }));
+    rows = (rows || []).map((r) => ({ ...r, target, species }));
 
+    // Optional debug: if ?debug=1, include what we matched
+    if ((req.query.debug || "") === "1") {
+      const debug = {
+        containerUsed: foundContainer,
+        cardSelectorUsed: foundCardSel,
+        rowsFound: rows.length
+      };
+      // attach to response later by stashing on request (picked up below)
+      req._biolegend_debug = debug;
+    }
   } catch (err) {
     console.error("BioLegend scrape failed:", err);
     rows = [];
+    if ((req.query.debug || "") === "1") {
+      req._biolegend_debug = { error: String(err) };
+    }
   }
 }
+
 
     // ------------ THERMO (WORKING) ------------
     if (vendor === "thermo") {
@@ -441,4 +544,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log("Playwright API listening on " + PORT)
 );
+
 
