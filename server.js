@@ -4,34 +4,229 @@ import { chromium } from "playwright";
 
 const app = express();
 
-/* ----------------------------- Helpers ----------------------------- */
-const normVendor = (vRaw) => {
-  const v = String(vRaw || "").toLowerCase().trim();
-  if (!v) return null;
-  if (v.includes("biolegend")) return "biolegend";
-  if (v.includes("thermo") || v.includes("invitrogen") || v.includes("ebioscience")) return "thermo";
-  if (v === "bd" || v.includes("biosciences")) return "bd";
-  return null;
-};
+/* =========================
+   TUNABLE SETTINGS
+   ========================= */
+const PORT = process.env.PORT || 3000;
+const MAX_CONCURRENCY = 3;              // limit parallel pages on free tier
+const PAGE_GOTO_TIMEOUT = 25000;        // ms
+const SELECTOR_TIMEOUT = 10000;         // ms
+const SHORT_WAIT = 600;                 // ms
+const SCROLL_PASSES = 3;                // keep small
+const LOAD_MORE_ATTEMPTS = 6;           // try a few times only
+const DEFAULT_LIMIT = 25;
+const DEFAULT_OFFSET = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000;     // 5 minutes
+const ENABLE_CACHE = true;
 
-const normLaser = (lRaw) => {
-  const l = String(lRaw || "").toLowerCase().trim();
+/* =========================
+   GLOBAL BROWSER (warm)
+   ========================= */
+let browserPromise = null;
+let activePages = 0;
+
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+  }
+  return browserPromise;
+}
+
+async function acquireSlot() {
+  while (activePages >= MAX_CONCURRENCY) {
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  activePages++;
+}
+
+function releaseSlot() {
+  activePages = Math.max(0, activePages - 1);
+}
+
+/* =========================
+   SMALL UTILITIES
+   ========================= */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function normVendor(vIn) {
+  const v = String(vIn || "").toLowerCase();
+  if (v.includes("biolegend")) return "biolegend";
+  if (v === "bd" || v.includes("biosciences")) return "bd";
+  if (v.includes("thermo") || v.includes("fisher")) return "thermo";
+  return null;
+}
+
+function normLaser(lIn) {
+  const l = String(lIn || "").toLowerCase();
   const map = {
     uv: "uv",
     violet: "violet",
     blue: "blue",
     yg: "yg",
-    "yellow": "yg",
+    yellow: "yg",
     "yellow-green": "yg",
     "yellow green": "yg",
-    "green": "yg",
+    green: "yg",
     red: "red",
   };
   return map[l] || null;
-};
+}
 
-const acceptCookies = async (page) => {
-  const selectors = [
+function normalizeSpecies(s) {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+// basic aliasing so your API succeeds even if user sends shorthand
+function normalizeTarget(tIn) {
+  let t = String(tIn || "").trim();
+  const low = t.toLowerCase();
+  const map = {
+    "tcrgd": "tcr gamma delta",
+    "tcrγδ": "tcr gamma delta",
+    "ifng": "ifn gamma",
+    "ifnγ": "ifn gamma",
+    "tnfa": "tnf alpha",
+    "tnfα": "tnf alpha",
+    "cd45r/b220": "cd45r b220",
+  };
+  if (map[low]) return map[low];
+  return t;
+}
+
+// strip trivial query params from links for dedupe
+function canonicalLink(href) {
+  try {
+    const u = new URL(href);
+    u.search = ""; // drop query for stricter dedupe; keep path/host
+    return u.toString();
+  } catch {
+    return href;
+  }
+}
+
+// universal dedupe (exact + near dupes)
+function dedupeRows(rows) {
+  const exactSeen = new Set();
+  const kept = [];
+
+  for (const r of rows) {
+    const keyExact = [
+      r.vendor || "",
+      (r.target || "").toLowerCase(),
+      (r.species || "").toLowerCase(),
+      (r.conjugate || "").toLowerCase(),
+      (r.product_name || "").replace(/\s+/g, " ").trim().toLowerCase(),
+      canonicalLink(r.link || "")
+    ].join("|");
+
+    if (exactSeen.has(keyExact)) continue;
+    exactSeen.add(keyExact);
+    kept.push({ ...r, link: canonicalLink(r.link || "") });
+  }
+
+  // near-dup squashing: same vendor/target/species/conjugate; minor name diffs
+  const nearSeen = new Map(); // key → first index
+  const final = [];
+  for (const r of kept) {
+    const nearKey = [
+      r.vendor || "",
+      (r.target || "").toLowerCase(),
+      (r.species || "").toLowerCase(),
+      (r.conjugate || "").toLowerCase(),
+    ].join("|");
+
+    const normName = String(r.product_name || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      // remove trivial test counts / units when present in name
+      .replace(/\b(\d+\s?tests?|test|µg|ug|vial|pack)\b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const stored = nearSeen.get(nearKey);
+    if (!stored) {
+      nearSeen.set(nearKey, { normName, link: r.link });
+      final.push(r);
+    } else {
+      // if the only diff is trivial (very similar), skip it
+      if (stored.normName === normName) {
+        continue;
+      } else {
+        // different enough: keep
+        final.push(r);
+      }
+    }
+  }
+
+  return final;
+}
+
+/* =========================
+   REQUEST OPTIMIZATION
+   ========================= */
+async function optimizePage(page, vendor) {
+  const vendorHost =
+    vendor === "biolegend"
+      ? "www.biolegend.com"
+      : vendor === "bd"
+      ? "www.bdbiosciences.com"
+      : "www.thermofisher.com";
+
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+  await page.setViewportSize({ width: 1366, height: 900 });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+
+  await page.route("**/*", (route) => {
+    const req = route.request();
+    const type = req.resourceType();
+    const url = req.url();
+
+    // Block heavy resources
+    if (
+      type === "image" ||
+      type === "media" ||
+      type === "font" ||
+      type === "stylesheet"
+    ) {
+      return route.abort();
+    }
+
+    // Allow only first-party + essential assets
+    try {
+      const u = new URL(url);
+      const host = u.hostname;
+      if (!host.endsWith(vendorHost)) {
+        // allow some CDNs if vendor depends on them
+        const allowed = [
+          "static.biolegend.com",
+          "assets.biolegend.com",
+          "static.bdbiosciences.com",
+          "assets.bdbiosciences.com",
+          "assets.thermofisher.com",
+          "cdn.thermofisher.com",
+        ];
+        if (!allowed.some((h) => host.endsWith(h))) {
+          return route.abort();
+        }
+      }
+    } catch {
+      // ignore URL parse errors; continue
+    }
+
+    return route.continue();
+  });
+}
+
+async function acceptCookies(page) {
+  const sels = [
     "#onetrust-accept-btn-handler",
     "button#onetrust-accept-btn-handler",
     "#truste-consent-button",
@@ -40,76 +235,51 @@ const acceptCookies = async (page) => {
     'button:has-text("Accept All")',
     'button:has-text("I Accept")',
     'button:has-text("Got it")',
-    'button:has-text("OK")',
   ];
-  for (const sel of selectors) {
+  for (const s of sels) {
     try {
-      const btn = await page.$(sel);
-      if (btn) {
-        await btn.click({ timeout: 1200 });
+      const el = await page.$(s);
+      if (el) {
+        await el.click({ timeout: 800 });
         await page.waitForTimeout(300);
       }
     } catch {}
   }
-};
+}
 
-const goProductsTabIfAny = async (page) => {
-  const tabSel = [
-    'a[role="tab"]:has-text("Products")',
-    'button[role="tab"]:has-text("Products")',
-    'a:has-text("Products")',
-  ];
-  for (const sel of tabSel) {
-    try {
-      const el = await page.$(sel);
-      if (el) {
-        await el.click({ timeout: 1200 });
-        await page.waitForTimeout(500);
-      }
-    } catch {}
-  }
-};
-
-const autoScroll = async (page, passes = 4, pauseMs = 600) => {
+async function autoScroll(page, passes = SCROLL_PASSES) {
   for (let i = 0; i < passes; i++) {
-    try {
-      await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.25));
-      await page.waitForTimeout(pauseMs);
-    } catch {}
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.2));
+    await page.waitForTimeout(SHORT_WAIT);
   }
-};
+}
 
-const clickLoadMoreIfAny = async (page, attempts = 6) => {
-  const selectors = [
+async function clickLoadMoreIfAny(page, attempts = LOAD_MORE_ATTEMPTS) {
+  const sels = [
     'button:has-text("Load more")',
     'button:has-text("Load 25 more results")',
     'button:has-text("Show more")',
   ];
   for (let i = 0; i < attempts; i++) {
     let clicked = false;
-    for (const sel of selectors) {
-      try {
-        const btn = await page.$(sel);
-        if (btn) {
+    for (const s of sels) {
+      const btn = await page.$(s);
+      if (btn) {
+        try {
           await btn.click();
           clicked = true;
-          await page.waitForTimeout(1200);
-        }
-      } catch {}
+          await page.waitForTimeout(900);
+        } catch {}
+      }
     }
     if (!clicked) break;
-    await autoScroll(page, 2, 500);
+    await autoScroll(page, 2);
   }
-};
+}
 
-const domainOK = (vendor) =>
-  vendor === "BioLegend"
-    ? "biolegend.com"
-    : vendor === "Thermo Fisher"
-    ? "thermofisher.com"
-    : "bdbiosciences.com";
-
-/* ----------------------------- URL Map ----------------------------- */
+/* =========================
+   URL BUILDERS
+   ========================= */
 const URL_MAP = {
   biolegend: {
     blue: (target, species) =>
@@ -181,7 +351,7 @@ const URL_MAP = {
         species
       )}%22=%22${encodeURIComponent(
         species
-      )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22UV%20Laser%22=%22UV%20Laser%22`,
+      )}%22&applicationName_facet_ss::%22Flow%20cytrometry%22=%22Flow%20cytrometry%22&excitationSource_facet_s::%22UV%20Laser%22=%22UV%20Laser%22`,
     violet: (target, species) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
         target
@@ -209,124 +379,126 @@ const URL_MAP = {
   },
 };
 
-/* -------------------------- Vendor scrapers -------------------------- */
-// BioLegend: paginates with &Page=N
-async function scrapeBioLegend(page, baseUrl, target, species, maxPages = 60) {
-  // ensure clean base (strip existing &Page=)
-  const start = baseUrl.replace(/([?&])Page=\d+/i, "$1").replace(/[?&]$/, "");
-  const makeUrl = (n) => start + (start.includes("?") ? `&Page=${n}` : `?Page=${n}`);
-
-  const seenLinks = new Set();
-  const all = [];
-
-  // shared prep
-  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
-  await page.setViewportSize({ width: 1366, height: 900 });
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
-
-  for (let p = 1; p <= maxPages; p++) {
-    const url = makeUrl(p);
-    await page.goto(url, { waitUntil: "networkidle", timeout: 60000 }).catch(() => {});
-    await acceptCookies(page);
-    await page.waitForTimeout(400);
-    await autoScroll(page, 4, 500);
-
-    const rows = await page.$$eval("li.row.list h2 a[itemprop='name']", (els) =>
-      els.map((a) => {
-        const name = (a.textContent || "").trim().replace(/\s+/g, " ");
-        let href = a.getAttribute("href") || "";
-        if (href && !/^https?:\/\//i.test(href)) {
-          href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
-        }
-        return { name, href };
-      })
-    );
-
-    let added = 0;
-    for (const { name, href } of rows) {
-      if (!href || seenLinks.has(href)) continue;
-      seenLinks.add(href);
-
-      // conjugate = everything before " anti-"
-      let conjugate = name;
-      const idx = name.toLowerCase().indexOf(" anti-");
-      if (idx > 0) conjugate = name.slice(0, idx).trim();
-
-      all.push({
-        vendor: "BioLegend",
-        product_name: name,
-        target,
-        species,
-        conjugate,
-        link: href,
-      });
-      added++;
-    }
-    if (added === 0) break; // no new items → stop
+/* =========================
+   CACHING (optional)
+   ========================= */
+const cache = new Map(); // key -> { t, payload }
+function cacheKey(obj) {
+  return JSON.stringify(obj);
+}
+function getCached(k) {
+  if (!ENABLE_CACHE) return null;
+  const hit = cache.get(k);
+  if (!hit) return null;
+  if (Date.now() - hit.t > CACHE_TTL_MS) {
+    cache.delete(k);
+    return null;
   }
-  return all;
+  return hit.payload;
+}
+function setCached(k, payload) {
+  if (!ENABLE_CACHE) return;
+  cache.set(k, { t: Date.now(), payload });
 }
 
-// Thermo Fisher: click "Load more" and scrape product cards
-async function scrapeThermo(page, url, target, species) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+/* =========================
+   SCRAPERS (minimal waits)
+   ========================= */
+async function scrapeBioLegend(page, startUrl, target, species) {
+  await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: PAGE_GOTO_TIMEOUT });
   await acceptCookies(page);
-  await goProductsTabIfAny(page);
-  await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  await autoScroll(page, 6, 500);
-  await clickLoadMoreIfAny(page, 6);
+  await autoScroll(page, 2);
+  await clickLoadMoreIfAny(page, LOAD_MORE_ATTEMPTS);
 
-  let rows = await page.$$eval(
-    "div.flex-container.product-info.ab-primary",
-    (blocks) =>
-      blocks
-        .map((b) => {
-          const a = b.querySelector("a.product-desc, a.product-desc-new");
-          const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
-          const href = a ? a.getAttribute("href") : null;
-          const link = href
-            ? href.startsWith("http")
-              ? href
-              : "https://www.thermofisher.com" + href
-            : null;
-          const hasSpecies = !!b.querySelector(".item.species-item");
-          return name && link
-            ? { vendor: "Thermo Fisher", product_name: name, link, hasSpecies }
-            : null;
-        })
-        .filter(Boolean)
-  );
+  // primary selector you provided
+  const anchors = await page.$$eval("li.row.list h2 a[itemprop='name']", (els) =>
+    els.map((a) => {
+      const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+      let href = a.getAttribute("href") || "";
+      if (href && !/^https?:\/\//i.test(href)) {
+        href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+      }
+      return { name, href };
+    })
+  ).catch(() => []);
 
-  rows = rows
-    .filter((r) => r.hasSpecies)
-    .map((r) => ({
-      vendor: r.vendor,
-      product_name: r.product_name,
+  const rows = anchors.map(({ name, href }) => {
+    let conjugate = name;
+    const idx = name.toLowerCase().indexOf(" anti-");
+    if (idx > 0) conjugate = name.slice(0, idx).trim();
+    return {
+      vendor: "BioLegend",
+      product_name: name,
       target,
       species,
-      conjugate: ((m) => (m ? m[1].trim() : r.product_name))(
-        /\)\s*,\s*([^,]+)(?:,|$)/.exec(r.product_name)
-      ),
-      link: r.link,
-    }));
+      conjugate,
+      link: href,
+    };
+  });
 
-  return rows;
+  // attempt to read visible total number if present (optional)
+  let total = rows.length;
+  try {
+    const t = await page.$eval(".resultCount, .viewing-results", (el) =>
+      (el.textContent || "").replace(/\s+/g, " ")
+    );
+    const m = /(\d[\d,]*)\s*(results|of)/i.exec(t);
+    if (m) total = parseInt(m[1].replace(/,/g, ""), 10);
+  } catch {}
+
+  return { rows, total };
 }
 
-// BD Biosciences: click "Show more"/"Load more", scrape cards
-async function scrapeBD(page, url, target, species) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+async function scrapeThermo(page, startUrl, target, species) {
+  await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: PAGE_GOTO_TIMEOUT });
   await acceptCookies(page);
-  await page.waitForLoadState("networkidle", { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(600);
-  await autoScroll(page, 4, 500);
-  await clickLoadMoreIfAny(page, 8);
+  await autoScroll(page, 2);
+  await clickLoadMoreIfAny(page, LOAD_MORE_ATTEMPTS);
 
-  const cardSel = "div.pdp-search-card__body, .pdp-search-card, article.pdp-search-card";
-  let rows = await page.$$eval(cardSel, (cards) =>
+  const blocksSel = "div.flex-container.product-info.ab-primary";
+  await page.waitForSelector(blocksSel, { timeout: SELECTOR_TIMEOUT }).catch(() => {});
+  let rows = await page.$$eval(blocksSel, (blocks) =>
+    blocks
+      .map((b) => {
+        const a = b.querySelector("a.product-desc, a.product-desc-new");
+        const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
+        const href = a ? a.getAttribute("href") : null;
+        const link =
+          href && href.startsWith("http")
+            ? href
+            : href
+            ? "https://www.thermofisher.com" + href
+            : null;
+        const hasSpecies = !!b.querySelector(".item.species-item");
+        return name && link && hasSpecies
+          ? { vendor: "Thermo Fisher", product_name: name, link }
+          : null;
+      })
+      .filter(Boolean)
+  ).catch(() => []);
+
+  rows = rows.map((r) => ({
+    vendor: r.vendor,
+    product_name: r.product_name,
+    target,
+    species,
+    conjugate:
+      (/\)\s*,\s*([^,]+)(?:,|$)/.exec(r.product_name) || [null, r.product_name])[1].trim(),
+    link: r.link,
+  }));
+
+  return { rows, total: rows.length };
+}
+
+async function scrapeBD(page, startUrl, target, species) {
+  await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: PAGE_GOTO_TIMEOUT });
+  await acceptCookies(page);
+  await autoScroll(page, 2);
+  await clickLoadMoreIfAny(page, LOAD_MORE_ATTEMPTS);
+
+  const cardsSel = "div.pdp-search-card__body, .pdp-search-card, article.pdp-search-card";
+  await page.waitForSelector(cardsSel, { timeout: SELECTOR_TIMEOUT }).catch(() => {});
+  let rows = await page.$$eval(cardsSel, (cards) =>
     cards
       .map((card) => {
         const a =
@@ -335,160 +507,163 @@ async function scrapeBD(page, url, target, species) {
           ) || null;
         const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
         let href = a ? a.getAttribute("href") : null;
-        if (href && !href.startsWith("http")) href = "https://www.bdbiosciences.com" + href;
+        if (href && !href.startsWith("http")) {
+          href = "https://www.bdbiosciences.com" + href;
+        }
         return name && href && href.includes("bdbiosciences.com")
           ? { vendor: "BD Biosciences", product_name: name, link: href }
           : null;
       })
       .filter(Boolean)
-  );
+  ).catch(() => []);
 
   rows = rows.map((r) => ({
     ...r,
     target,
     species,
-    conjugate: ((m) => (m ? m[1].trim() : r.product_name))(/\)\s*(.*)$/.exec(r.product_name)),
+    conjugate: (/\)\s*(.*)$/.exec(r.product_name) || [null, r.product_name])[1].trim(),
   }));
 
-  return rows;
+  return { rows, total: rows.length };
 }
 
-/* ------------------------------- Routes ------------------------------- */
-app.get("/", (_req, res) => {
-  res
-    .type("text/plain")
-    .send(
-      "Antibody Playwright API is running.\nTry:\n/search?vendor=BioLegend&target=CD3&species=Human&laser=Blue&limit=20&offset=0\n/table?vendor=BioLegend&target=CD3&species=Human&laser=Blue&limit=20&offset=0"
-    );
-});
-
+/* =========================
+   SEARCH ROUTE (JSON)
+   ========================= */
 app.get("/search", async (req, res) => {
-  const vendor = normVendor(req.query.vendor);
-  const target = (req.query.target || "").trim();
-  const species = (req.query.species || "Human").trim();
-  const laser = normLaser(req.query.laser);
+  const vendorRaw = req.query.vendor || "";
+  const targetRaw = req.query.target || "";
+  const speciesRaw = req.query.species || "Human";
+  const laserRaw = req.query.laser || "";
   const override = req.query.override_url || "";
-  const debugWanted = (req.query.debug || "") === "1";
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || DEFAULT_LIMIT, 10)));
+  const offset = Math.max(0, parseInt(req.query.offset || DEFAULT_OFFSET, 10));
+  const debug = (req.query.debug || "") === "1";
 
-  // pagination controls for API response slicing
-  let limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10) || 50, 1), 200);
-  let offset = Math.max(parseInt(req.query.offset || "0", 10) || 0, 0);
+  const vendor = normVendor(vendorRaw);
+  const laser = normLaser(laserRaw);
+  const species = normalizeSpecies(speciesRaw);
+  const target = normalizeTarget(targetRaw);
 
   if (!vendor || !target || !species || !laser) {
     return res.status(400).json({ error: "bad_params" });
   }
 
-  const urlBuilder = URL_MAP[vendor] && URL_MAP[vendor][laser];
-  if (!urlBuilder && !override) {
-    return res.status(400).json({ error: "unsupported_vendor_or_laser" });
+  const key = cacheKey({ vendor, target, species, laser }); // cache per full set
+  const cached = getCached(key);
+  if (cached) {
+    // slice on API layer (fast)
+    const deduped = dedupeRows(cached.rows || []);
+    const total = cached.total ?? deduped.length;
+    const pageRows = deduped.slice(offset, offset + limit);
+    return res.json({ rows: pageRows, total, vendor, target, species, laser, cached: true });
   }
 
-  const startUrl = override || urlBuilder(target, species);
-
-  const browser = await chromium.launch({
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    headless: true,
-  });
-  const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  });
-
+  let context, page;
   try {
-    let rows = [];
-    if (vendor === "biolegend") {
-      rows = await scrapeBioLegend(page, startUrl, target, species, 80); // allow many pages
-    } else if (vendor === "thermo") {
-      rows = await scrapeThermo(page, startUrl, target, species);
-    } else if (vendor === "bd") {
-      rows = await scrapeBD(page, startUrl, target, species);
-    }
+    await acquireSlot();
+    const browser = await getBrowser();
+    context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+    page = await context.newPage();
 
-    // domain guard + exact-duplicate removal
-    const seen = new Set();
-    const final = [];
-    for (const r of rows) {
-      if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
-      const key = `${r.vendor}|${(r.product_name || "").trim()}|${r.link}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      final.push(r);
-    }
+    await optimizePage(page, vendor);
 
-    const total = final.length;
-    const sliced = final.slice(offset, offset + limit);
+    const builder = URL_MAP[vendor][laser];
+    const startUrl = override || builder(target, species);
 
-    const payload = debugWanted
-      ? { total, limit, offset, rows: sliced, debug: { startUrl } }
-      : { total, limit, offset, rows: sliced };
+    let result = { rows: [], total: 0 };
+    if (vendor === "biolegend") result = await scrapeBioLegend(page, startUrl, target, species);
+    else if (vendor === "thermo") result = await scrapeThermo(page, startUrl, target, species);
+    else result = await scrapeBD(page, startUrl, target, species);
 
-    return res.json(payload);
+    // Cache full set (pre-sliced), then slice for response
+    setCached(key, result);
+
+    const deduped = dedupeRows(result.rows || []);
+    const total = result.total || deduped.length;
+    const pageRows = deduped.slice(offset, offset + limit);
+
+    return res.json({
+      rows: pageRows,
+      total,
+      vendor,
+      target,
+      species,
+      laser,
+      url: debug ? startUrl : undefined,
+    });
   } catch (e) {
     return res.status(502).json({ error: "fetch_or_parse_failed", detail: String(e) });
   } finally {
-    await browser.close();
+    try {
+      if (page) await page.close();
+      if (context) await context.close();
+    } catch {}
+    releaseSlot();
   }
 });
 
-// Nicely formatted HTML table (for quick eyeballing)
+/* =========================
+   TABLE ROUTE (HTML helper)
+   ========================= */
 app.get("/table", async (req, res) => {
-  // proxy to /search then render a table
-  const params = new URLSearchParams();
-  for (const [k, v] of Object.entries(req.query)) params.set(k, v);
-  const base = req.protocol + "://" + req.get("host");
-  const url = `${base}/search?${params.toString()}`;
+  // proxy to /search then render simple table
+  const url = new URL(req.protocol + "://" + req.get("host") + req.originalUrl);
+  url.pathname = "/search";
+  const params = Object.fromEntries(url.searchParams.entries());
 
-  try {
-    const r = await fetch(url);
-    const data = await r.json();
-    const rows = data.rows || [];
-    const total = data.total || rows.length;
-    const limit = data.limit ?? rows.length;
-    const offset = data.offset ?? 0;
+  // local call
+  req.url = "/search?" + new URLSearchParams(params).toString();
+  const send = res.json.bind(res);
 
-    const header =
-      `<h2>Results for ${req.query.target || ""} (${req.query.laser || ""}) — showing ${rows.length} of ${total} (limit=${limit}, offset=${offset})</h2>`;
-    const tableHead =
-      `<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;font-family:Arial, sans-serif;font-size:13px;">
-        <thead><tr>
-          <th>#</th><th>Vendor</th><th>Product Name</th><th>Target</th><th>Species</th><th>Conjugate</th><th>Link</th>
-        </tr></thead><tbody>`;
-    const tableRows = rows
-      .map((r, i) => {
-        const n = offset + i + 1;
-        return `<tr>
-          <td>${n}</td>
-          <td>${r.vendor || ""}</td>
-          <td>${escapeHtml(r.product_name || "")}</td>
-          <td>${escapeHtml(r.target || "")}</td>
-          <td>${escapeHtml(r.species || "")}</td>
-          <td>${escapeHtml(r.conjugate || "")}</td>
-          <td><a href="${r.link}" target="_blank" rel="noreferrer noopener">Link</a></td>
-        </tr>`;
-      })
-      .join("");
-    const tableEnd = `</tbody></table>`;
+  // intercept JSON and render HTML
+  res.json = (payload) => {
+    if (payload.error) return send(payload);
+    const { rows = [], total = rows.length, vendor, target, species, laser } = payload;
 
-    res.type("text/html").send(header + tableHead + tableRows + tableEnd);
-  } catch (e) {
-    res
-      .status(502)
-      .type("text/plain")
-      .send("Failed to render table.\n\n" + String(e));
-  }
+    const header = `<h3>Results for ${target} / ${species} / ${laser} — ${vendor} (showing ${rows.length} of ${total})</h3>`;
+    const table =
+      `<table border="1" cellpadding="6" cellspacing="0">` +
+      `<thead><tr><th>#</th><th>Vendor</th><th>Product Name</th><th>Target</th><th>Species</th><th>Conjugate</th><th>Link</th></tr></thead>` +
+      `<tbody>` +
+      rows
+        .map((r, i) => {
+          const link = r.link ? `<a href="${r.link}" target="_blank" rel="noopener">Open</a>` : "";
+          return `<tr>
+            <td>${i + 1}</td>
+            <td>${r.vendor || ""}</td>
+            <td>${r.product_name || ""}</td>
+            <td>${r.target || ""}</td>
+            <td>${r.species || ""}</td>
+            <td>${r.conjugate || ""}</td>
+            <td>${link}</td>
+          </tr>`;
+        })
+        .join("") +
+      `</tbody></table>`;
+    res.type("text/html").send(header + table);
+  };
+
+  app._router.handle(req, res, () => {});
 });
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
+/* =========================
+   ROOT / HEALTH
+   ========================= */
+app.get("/", (req, res) => {
+  res
+    .type("text/plain")
+    .send(
+      "Antibody Playwright API running.\nTry JSON: /search?vendor=BioLegend&target=CCR7&species=Human&laser=Blue&limit=25&offset=0\nTry HTML: /table?vendor=BD&target=CD3&species=Human&laser=Red&limit=25&offset=0"
+    );
+});
 
-/* ------------------------------ Server ------------------------------ */
-const PORT = process.env.PORT || 3000;
+/* =========================
+   START
+   ========================= */
 app.listen(PORT, () => {
   console.log("Playwright API listening on " + PORT);
 });
-
