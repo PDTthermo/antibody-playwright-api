@@ -221,6 +221,7 @@ app.get("/search", async (req, res) => {
   }
 
   const startUrl = override || URL_MAP[vendor][laser](target, species);
+console.log("Start URL:", startUrl);
 
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -530,7 +531,12 @@ if (vendor === "biolegend") {
       final.push(r);
     }
 
-    res.json({ rows: final });
+ const debug = (req.query.debug || "") === "1";
+if (debug) {
+  return res.json({ url: startUrl, rows: final });
+} else {
+  return res.json({ rows: final });
+}
   } catch (e) {
     res
       .status(502)
@@ -544,5 +550,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log("Playwright API listening on " + PORT)
 );
+
 
 
