@@ -471,7 +471,10 @@ app.get("/search", async (req, res) => {
 
   const vendor = normVendor(vendorIn);
   const laser = normLaser(laserIn);
-
+  
+  // 🆕 Pagination controls (add these lines)
+  const limit = Math.max(1, Math.min(Number(req.query.limit || 30), 100));
+  const offset = Math.max(0, Number(req.query.offset || 0));
   if (!vendor || !target || !species || !laser) {
     return res.status(400).json({ error: "bad_params" });
   }
@@ -501,48 +504,42 @@ app.get("/search", async (req, res) => {
 
       let rows = [...thermoRows, ...bdRows, ...bl.rows];
 
-      // dedupe
-     const domainOK = (v) =>
+// ---------- Domain Guard + Deduplication ----------
+const domainOK = (v) =>
   v === "BioLegend"
     ? "biolegend.com"
     : v === "Thermo Fisher"
     ? "thermofisher.com"
     : "bdbiosciences.com";
 
-// remove exact duplicates and near duplicates (same target + conjugate + vendor)
+// remove exact/near duplicates (same vendor+target+species+conjugate)
 const seen = new Set();
-const final = [];
+let final = [];
 for (const r of rows) {
   if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
-  const key = `${r.vendor}|${r.target}|${r.conjugate}|${r.product_name.replace(/\s+/g, " ")}`;
+  const key = `${r.vendor}|${(r.target||"").toUpperCase()}|${(r.species||"").toUpperCase()}|${(r.conjugate||"").toUpperCase()}`;
   if (seen.has(key)) continue;
   seen.add(key);
   final.push(r);
 }
-      payload = debugWanted
-        ? { rows: final, debug: { thermoUrl, bdUrl, bioLegend: bl.debug } }
-        : { rows: final };
-    } else if (vendor === "thermo") {
-      const startUrl = override || URL_MAP.thermo[laser](target, species);
-      const rows = await scrapeThermo(page, startUrl, target, species);
-      payload = debugWanted ? { url: startUrl, rows } : { rows };
-    } else if (vendor === "bd") {
-      const startUrl = override || URL_MAP.bd[laser](target, species);
-      const rows = await scrapeBD(page, startUrl, target, species);
-      payload = debugWanted ? { url: startUrl, rows } : { rows };
-    } else {
-      // biolegend
-      const bl = await scrapeBioLegend(page, target, species, laser);
-      payload = debugWanted ? { rows: bl.rows, debug: bl.debug } : { rows: bl.rows };
-    }
 
-    return res.json(payload);
-  } catch (e) {
-    return res.status(502).json({ error: "fetch_or_parse_failed", detail: String(e) });
-  } finally {
-    await browser.close();
-  }
-});
+// apply pagination window AFTER dedupe
+const total = final.length;
+final = final.slice(offset, offset + limit);
+
+const debug = (req.query.debug || "") === "1";
+if (debug) {
+  return res.json({
+    url: startUrl,
+    total,
+    limit,
+    offset,
+    rows: final,
+    debug: req._debug_vendor || null
+  });
+} else {
+  return res.json({ total, limit, offset, rows: final });
+}
 
 /* ------------------------------ Simple HTML table --------------------------- */
 app.get("/table", async (req, res) => {
@@ -606,9 +603,107 @@ app.get("/table", async (req, res) => {
   }
 });
 
+ /* ------------------------------ JSON facade --------------------------- */
+app.get("/json", async (req, res) => {
+  // Reuse the /search route by internally calling it.
+  // Simpler: proxy parameters into /search and return JSON as-is.
+  try {
+    const base = `${req.protocol}://${req.get("host")}`;
+    const qs = new URLSearchParams({
+      vendor: String(req.query.vendor || ""),
+      target: String(req.query.target || ""),
+      species: String(req.query.species || ""),
+      laser: String(req.query.laser || ""),
+      limit: String(req.query.limit || "30"),
+      offset: String(req.query.offset || "0"),
+      debug: String(req.query.debug || "")
+    });
+    const resp = await fetch(`${base}/search?${qs.toString()}`);
+    const data = await resp.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: "json_facade_failed", detail: String(e) });
+  }
+});
+
+/* --------------------------- Numbered Table (uses /json) ------------------ */
+app.get("/table", async (req, res) => {
+  try {
+    const base = `${req.protocol}://${req.get("host")}`;
+    const qs = new URLSearchParams({
+      vendor: String(req.query.vendor || ""),
+      target: String(req.query.target || ""),
+      species: String(req.query.species || ""),
+      laser: String(req.query.laser || ""),
+      limit: String(req.query.limit || "50"),
+      offset: String(req.query.offset || "0")
+    });
+    const resp = await fetch(`${base}/json?${qs.toString()}`);
+    const data = await resp.json();
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const total = Number(data.total || rows.length);
+    const limit = Number(data.limit || rows.length);
+    const offset = Number(data.offset || 0);
+
+    // group by vendor
+    const grouped = {};
+    for (const r of rows) {
+      const v = r.vendor || "Unknown Vendor";
+      if (!grouped[v]) grouped[v] = [];
+      grouped[v].push(r);
+    }
+
+    let html = `<h2>Results for ${req.query.target} (${req.query.laser}) — showing ${rows.length} of ${total} (limit=${limit}, offset=${offset})</h2>`;
+    for (const [vendor, list] of Object.entries(grouped)) {
+      html += `<h3>${vendor} (${list.length} in page)</h3>
+      <table border="1" cellpadding="6" cellspacing="0" style="margin-bottom:20px;">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Product Name</th>
+            <th>Target</th>
+            <th>Species</th>
+            <th>Conjugate</th>
+            <th>Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${list
+            .map(
+              (r, i) =>
+                `<tr>
+                  <td>${i + 1 + offset}</td>
+                  <td>${r.product_name || ""}</td>
+                  <td>${r.target || ""}</td>
+                  <td>${r.species || ""}</td>
+                  <td>${r.conjugate || ""}</td>
+                  <td><a href="${r.link}" target="_blank">View</a></td>
+                </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>`;
+    }
+
+    // basic pager links
+    const baseLink = `${req.path}?vendor=${encodeURIComponent(String(req.query.vendor||""))}&target=${encodeURIComponent(String(req.query.target||""))}&species=${encodeURIComponent(String(req.query.species||""))}&laser=${encodeURIComponent(String(req.query.laser||""))}&limit=${limit}`;
+    const prev = Math.max(0, offset - limit);
+    const next = offset + limit < total ? offset + limit : null;
+    html += `<div style="margin:10px 0;">
+      ${offset > 0 ? `<a href="${baseLink}&offset=${prev}">Prev</a>` : ""}
+      ${next !== null ? ` &nbsp; <a href="${baseLink}&offset=${next}">Next</a>` : ""}
+    </div>`;
+
+    res.type("text/html").send(html);
+  } catch (e) {
+    res.status(500).type("text/plain").send("Failed to render table: " + String(e));
+  }
+});
+     
 /* --------------------------------- Boot --------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Playwright API listening on " + PORT));
+
 
 
 
