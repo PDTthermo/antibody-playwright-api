@@ -3,38 +3,40 @@ import { chromium } from "playwright";
 
 const app = express();
 
-// Optional friendly homepage
+/* ----------------------------- Small homepage ----------------------------- */
 app.get("/", (req, res) => {
   res
     .type("text/plain")
     .send(
-      "Antibody Playwright API is running.\nTry: /search?vendor=BioLegend&target=CCR7&species=Human&laser=Blue"
+      [
+        "Antibody Playwright API is running.",
+        "JSON: /search?vendor=BioLegend&target=CCR7&species=Human&laser=Blue",
+        "ALL vendors: /search?vendor=All&target=CD3&species=Human&laser=Red&debug=1",
+        "TABLE: /table?vendor=BioLegend&target=CCR7&species=Human&laser=Blue",
+      ].join("\n")
     );
 });
 
-// ----------- Helpers -----------
-const normVendor = (v) =>
-  v.includes("biolegend")
-    ? "biolegend"
-    : v.includes("thermo")
-    ? "thermo"
-    : v === "bd" || v.includes("biosciences")
-    ? "bd"
-    : null;
+/* --------------------------------- Helpers -------------------------------- */
+const normVendor = (v) => {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "all") return "all";
+  if (s.includes("biolegend")) return "biolegend";
+  if (s.includes("thermo")) return "thermo";
+  if (s === "bd" || s.includes("biosciences")) return "bd";
+  return null;
+};
 
 const normLaser = (l) => {
-  const map = {
-    uv: "uv",
-    violet: "violet",
-    blue: "blue",
-    yg: "yg",
-    yellow: "yg",
-    "yellow-green": "yg",
-    "yellow green": "yg",
-    green: "yg",
-    red: "red",
-  };
-  return map[l] || null;
+  const s = String(l || "").trim().toLowerCase();
+  if (!s) return null;
+  if (s === "uv") return "uv";
+  if (s.includes("violet") || s === "v") return "violet";
+  if (s === "yg" || s.includes("yellow") || s.includes("green")) return "yg";
+  if (s.includes("red") || s.includes("ir")) return "red";
+  if (s.includes("blue") || s === "b") return "blue";
+  return null;
 };
 
 const acceptCookies = async (page) => {
@@ -53,7 +55,7 @@ const acceptCookies = async (page) => {
     if (btn) {
       try {
         await btn.click({ timeout: 1200 });
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(400);
       } catch {}
     }
   }
@@ -70,7 +72,7 @@ const goProductsTabIfAny = async (page) => {
     if (el) {
       try {
         await el.click({ timeout: 1200 });
-        await page.waitForTimeout(600);
+        await page.waitForTimeout(500);
       } catch {}
     }
   }
@@ -79,11 +81,11 @@ const goProductsTabIfAny = async (page) => {
 const autoScroll = async (page, passes = 6) => {
   for (let i = 0; i < passes; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight * 1.2));
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(600);
   }
 };
 
-const clickLoadMoreIfAny = async (page, attempts = 5) => {
+const clickLoadMoreIfAny = async (page, attempts = 6) => {
   const loadMoreSelectors = [
     'button:has-text("Load more")',
     'button:has-text("Load 25 more results")',
@@ -95,9 +97,12 @@ const clickLoadMoreIfAny = async (page, attempts = 5) => {
       const btn = await page.$(lm);
       if (btn) {
         try {
-          await btn.click();
+          await Promise.all([
+            page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {}),
+            btn.click(),
+          ]);
           clicked = true;
-          await page.waitForTimeout(1200);
+          await page.waitForTimeout(900);
         } catch {}
       }
     }
@@ -106,313 +111,195 @@ const clickLoadMoreIfAny = async (page, attempts = 5) => {
   }
 };
 
-// ----------- URL Map -----------
+/* -------------------------------- URL builders ---------------------------- */
 const URL_MAP = {
   biolegend: {
-    blue: (target, species) =>
+    blue: (t, s) =>
       `https://www.biolegend.com/en-us/search-results?ExcitationLaser=bluelaser&Keywords=${encodeURIComponent(
-        target
-      )}&PageSize=100&Reactivity=${encodeURIComponent(species)}`,
-    uv: (target, species) =>
+        t
+      )}&PageSize=100&Reactivity=${encodeURIComponent(s)}`,
+    uv: (t, s) =>
       `https://www.biolegend.com/en-us/search-results?ExcitationLaser=uvlaser&Keywords=${encodeURIComponent(
-        target
-      )}&PageSize=100&Reactivity=${encodeURIComponent(species)}`,
-    violet: (target, species) =>
+        t
+      )}&PageSize=100&Reactivity=${encodeURIComponent(s)}`,
+    violet: (t, s) =>
       `https://www.biolegend.com/en-us/search-results?ExcitationLaser=violetlaser&Keywords=${encodeURIComponent(
-        target
-      )}&PageSize=100&Reactivity=${encodeURIComponent(species)}`,
-    yg: (target, species) =>
+        t
+      )}&PageSize=100&Reactivity=${encodeURIComponent(s)}`,
+    yg: (t, s) =>
       `https://www.biolegend.com/en-us/search-results?ExcitationLaser=yellowgreenlaser&Keywords=${encodeURIComponent(
-        target
-      )}&PageSize=100&Reactivity=${encodeURIComponent(species)}`,
-    red: (target, species) =>
+        t
+      )}&PageSize=100&Reactivity=${encodeURIComponent(s)}`,
+    red: (t, s) =>
       `https://www.biolegend.com/en-us/search-results?ExcitationLaser=redlaser&Keywords=${encodeURIComponent(
-        target
-      )}&PageSize=100&Reactivity=${encodeURIComponent(species)}`,
+        t
+      )}&PageSize=100&Reactivity=${encodeURIComponent(s)}`,
   },
   thermo: {
-    blue: (target, species) =>
+    blue: (t, s) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
-        target
+        t
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
-        species
+        s
       )}/compatibility/488+nm+(Blue)`,
-    uv: (target, species) =>
+    uv: (t, s) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
-        target
+        t
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
-        species
+        s
       )}/compatibility/355+nm+(UV)`,
-    violet: (target, species) =>
+    violet: (t, s) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
-        target
+        t
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
-        species
+        s
       )}/compatibility/405+nm+(Violet)`,
-    yg: (target, species) =>
+    yg: (t, s) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
-        target
+        t
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
-        species
+        s
       )}/compatibility/561+nm+(Yellow-Green)`,
-    red: (target, species) =>
+    red: (t, s) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
-        target
+        t
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
-        species
+        s
       )}/compatibility/633+nm+(Red)`,
   },
   bd: {
-    blue: (target, species) =>
+    blue: (t, s) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
-        target
+        t
       )}&speciesReactivity_facet_ss::%22${encodeURIComponent(
-        species
+        s
       )}%22=%22${encodeURIComponent(
-        species
+        s
       )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22Blue%20488%20nm%22=%22Blue%20488%20nm%22`,
-    uv: (target, species) =>
+    uv: (t, s) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
-        target
+        t
       )}&speciesReactivity_facet_ss::%22${encodeURIComponent(
-        species
+        s
       )}%22=%22${encodeURIComponent(
-        species
+        s
       )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22UV%20Laser%22=%22UV%20Laser%22`,
-    violet: (target, species) =>
+    violet: (t, s) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
-        target
+        t
       )}&speciesReactivity_facet_ss::%22${encodeURIComponent(
-        species
+        s
       )}%22=%22${encodeURIComponent(
-        species
+        s
       )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22Violet%20405%20nm%22=%22Violet%20405%20nm%22`,
-    yg: (target, species) =>
+    yg: (t, s) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
-        target
+        t
       )}&speciesReactivity_facet_ss::%22${encodeURIComponent(
-        species
+        s
       )}%22=%22${encodeURIComponent(
-        species
+        s
       )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22Yellow-Green%20561%20nm%22=%22Yellow-Green%20561%20nm%22`,
-    red: (target, species) =>
+    red: (t, s) =>
       `https://www.bdbiosciences.com/en-us/search-results?searchKey=${encodeURIComponent(
-        target
+        t
       )}&speciesReactivity_facet_ss::%22${encodeURIComponent(
-        species
+        s
       )}%22=%22${encodeURIComponent(
-        species
+        s
       )}%22&applicationName_facet_ss::%22Flow%20cytometry%22=%22Flow%20cytometry%22&excitationSource_facet_s::%22Red%20627-640%20nm%22=%22Red%20627-640%20nm%22`,
   },
 };
 
-// ----------- Route -----------
-app.get("/search", async (req, res) => {
-  const vendorIn = (req.query.vendor || "").toLowerCase();
-  const target = (req.query.target || "").trim();
-  const species = (req.query.species || "Human").trim();
-  const laserIn = (req.query.laser || "").toLowerCase();
-  const override = req.query.override_url || "";
+/* --------------------- BioLegend laser synonyms candidates --------------------- */
+const LASER_ALIASES = {
+  biolegend: {
+    blue: ["bluelaser"],
+    violet: ["violetlaser", "uvlaser"],
+    uv: ["uvlaser", "violetlaser"],
+    yg: ["yellowgreenlaser", "greenlaser"],
+    red: ["redlaser"],
+  },
+};
+const getBioLegendUrls = (target, species, laser) => {
+  const c = LASER_ALIASES.biolegend[laser] || ["bluelaser"];
+  return c.map(
+    (val) =>
+      `https://www.biolegend.com/en-us/search-results?ExcitationLaser=${encodeURIComponent(
+        val
+      )}&Keywords=${encodeURIComponent(target)}&PageSize=100&Reactivity=${encodeURIComponent(
+        species
+      )}`
+  );
+};
 
-  const vendor = normVendor(vendorIn);
-  const laser = normLaser(laserIn);
-  if (!vendor || !target || !species || !laser) {
-    return res.status(400).json({ error: "bad_params" });
-  }
+/* ------------------------- Vendor-specific scrapers ------------------------- */
+async function scrapeThermo(page, startUrl, target, species) {
+  await page.goto(startUrl, { timeout: 60000, waitUntil: "domcontentloaded" });
+  await acceptCookies(page);
+  await goProductsTabIfAny(page);
+  await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  await autoScroll(page, 6);
+  await clickLoadMoreIfAny(page, 10);
 
-  const startUrl = override || URL_MAP[vendor][laser](target, species);
-console.log("Start URL:", startUrl);
+  let rows = await page.$$eval(
+    "div.flex-container.product-info.ab-primary",
+    (blocks) =>
+      blocks
+        .map((b) => {
+          const a = b.querySelector("a.product-desc, a.product-desc-new");
+          const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
+          const href = a ? a.getAttribute("href") : null;
+          const link = href
+            ? href.startsWith("http")
+              ? href
+              : "https://www.thermofisher.com" + href
+            : null;
+          const hasSpecies = !!b.querySelector(".item.species-item");
+          return name && link
+            ? {
+                vendor: "Thermo Fisher",
+                product_name: name,
+                link,
+                hasSpecies,
+              }
+            : null;
+        })
+        .filter(Boolean)
+  );
 
-  const browser = await chromium.launch({
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    headless: true,
-  });
-  const page = await browser.newPage({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  });
-
-  try {
-    await page.goto(startUrl, {
-      timeout: 60000,
-      waitUntil: "domcontentloaded",
-    });
-
-    // General prep
-    await acceptCookies(page);
-    await goProductsTabIfAny(page);
-    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-    await autoScroll(page, 8);
-    await clickLoadMoreIfAny(page, 5);
-
-    let rows = [];
-
-// ------------ BIOLEGEND ------------
-if (vendor === "biolegend") {
-    await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
-  await page.setViewportSize({ width: 1366, height: 900 });
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
-  try {
-    // Hit the URL and let their JS render
-    await page.goto(startUrl, { waitUntil: "networkidle", timeout: 60000 });
-    await acceptCookies(page);
-    await page.waitForTimeout(800);
-    await autoScroll(page, 8);
-
-    // Use the exact structure you showed, plus two fallbacks
-    const counts = await page.evaluate(() => ({
-      primary: document.querySelectorAll("li.row.list h2 a[itemprop='name']").length,
-      liName: document.querySelectorAll("li.row.list a[itemprop='name']").length,
-      anyProducts: document.querySelectorAll("a[href*='/products/']").length
+  rows = rows
+    .filter((r) => r.hasSpecies)
+    .map((r) => ({
+      vendor: r.vendor,
+      product_name: r.product_name,
+      target,
+      species,
+      conjugate: ((m) => (m ? m[1].trim() : r.product_name))(
+        /\)\s*,\s*([^,]+)(?:,|$)/.exec(r.product_name)
+      ),
+      link: r.link,
     }));
 
-    let anchors = [];
-    if (counts.primary > 0) {
-      anchors = await page.$$eval(
-        "li.row.list h2 a[itemprop='name']",
-        (els) => els.map((a) => {
-          const name = (a.textContent || "").trim().replace(/\s+/g, " ");
-          let href = a.getAttribute("href") || "";
-          if (href && !/^https?:\/\//i.test(href)) {
-            href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
-          }
-          return { name, href };
-        })
-      );
-    } else if (counts.liName > 0) {
-      anchors = await page.$$eval(
-        "li.row.list a[itemprop='name']",
-        (els) => els.map((a) => {
-          const name = (a.textContent || "").trim().replace(/\s+/g, " ");
-          let href = a.getAttribute("href") || "";
-          if (href && !/^https?:\/\//i.test(href)) {
-            href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
-          }
-          return { name, href };
-        })
-      );
-    } else if (counts.anyProducts > 0) {
-      anchors = await page.$$eval(
-        "a[href*='/products/']",
-        (els) => els
-          .map((a) => {
-            const name = (a.textContent || "").trim().replace(/\s+/g, " ");
-            let href = a.getAttribute("href") || "";
-            if (href && !/^https?:\/\//i.test(href)) {
-              href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
-            }
-            return { name, href };
-          })
-          .filter((x) => x.name && /biolegend\.com/i.test(x.href))
-      );
-    }
-
-    rows = (anchors || []).map(({ name, href }) => {
-      let conjugate = name;
-      const idx = name.toLowerCase().indexOf(" anti-");
-      if (idx > 0) conjugate = name.slice(0, idx).trim();
-      return {
-        vendor: "BioLegend",
-        product_name: name,
-        target,
-        species,
-        conjugate,
-        link: href
-      };
-    });
-
-    // Attach tiny debug if requested
-    if ((req.query.debug || "") === "1") {
-      req._debug_vendor = { biolegend: { counts, rowsFound: rows.length } };
-    }
-
-  } catch (err) {
-    console.error("BioLegend scrape failed:", err);
-    rows = [];
-    if ((req.query.debug || "") === "1") {
-      req._debug_vendor = { biolegend: { error: String(err) } };
-    }
-  }
+  return rows;
 }
-    // ------------ THERMO (WORKING) ------------
-    if (vendor === "thermo") {
-      await page
-        .waitForSelector(
-          "div.flex-container.product-info.ab-primary, .product-results, .search-results",
-          { timeout: 8000 }
-        )
-        .catch(() => {});
-      // Load more if present
-      for (let i = 0; i < 3; i++) {
-        const btn = await page.$(
-          'button:has-text("Load 25 more results"), button:has-text("Load more")'
-        );
-        if (!btn) break;
-        try {
-          await btn.click();
-        } catch {}
-        await page.waitForTimeout(1000);
-      }
 
-      rows = await page.$$eval(
-        "div.flex-container.product-info.ab-primary",
-        (blocks) =>
-          blocks
-            .map((b) => {
-              const a = b.querySelector("a.product-desc, a.product-desc-new");
-              const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
-              const href = a ? a.getAttribute("href") : null;
-              const link = href
-                ? href.startsWith("http")
-                  ? href
-                  : "https://www.thermofisher.com" + href
-                : null;
-              const hasSpecies = !!b.querySelector(".item.species-item");
-              return name && link
-                ? {
-                    vendor: "Thermo Fisher",
-                    product_name: name,
-                    link,
-                    hasSpecies,
-                  }
-                : null;
-            })
-            .filter(Boolean)
-      );
+async function scrapeBD(page, startUrl, target, species) {
+  await page.goto(startUrl, { timeout: 60000, waitUntil: "domcontentloaded" });
+  await acceptCookies(page);
+  await page.waitForLoadState("networkidle", { timeout: 25000 }).catch(() => {});
+  await page.waitForSelector(
+    "div.pdp-search-card__body, .pdp-search-card, a.card-title",
+    { timeout: 15000 }
+  ).catch(() => {});
+  await autoScroll(page, 4);
+  await clickLoadMoreIfAny(page, 6);
 
-      rows = rows
-        .filter((r) => r.hasSpecies)
-        .map((r) => ({
-          vendor: r.vendor,
-          product_name: r.product_name,
-          target,
-          species,
-          conjugate: ((m) => (m ? m[1].trim() : r.product_name))(
-            /\)\s*,\s*([^,]+)(?:,|$)/.exec(r.product_name)
-          ),
-          link: r.link,
-        }));
-    }
-
-    // ------------ BD ------------
-    if (vendor === "bd") {
-      await page
-        .waitForLoadState("networkidle", { timeout: 25000 })
-        .catch(() => {});
-      await page
-        .waitForSelector(
-          "div.pdp-search-card__body, .pdp-search-card, a.card-title",
-          { timeout: 15000 }
-        )
-        .catch(() => {});
-      await clickLoadMoreIfAny(page, 5);
-
-      const bdCardsSel =
-        "div.pdp-search-card__body, .pdp-search-card, article.pdp-search-card";
-      rows = await page.$$eval(bdCardsSel, (cards) =>
+  const collect = async () =>
+    page.$$eval(
+      "div.pdp-search-card__body, .pdp-search-card, article.pdp-search-card",
+      (cards) =>
         cards
           .map((card) => {
             const a =
@@ -428,58 +315,279 @@ if (vendor === "biolegend") {
               : null;
           })
           .filter(Boolean)
-      );
+    );
 
-      rows = rows.map((r) => ({
-        ...r,
-        target,
-        species,
-        conjugate: ((m) => (m ? m[1].trim() : r.product_name))(
-          /\)\s*(.*)$/.exec(r.product_name)
-        ),
-      }));
+  let rows = await collect();
+
+  // ---- Numbered/Next pagination (up to 5 next pages) ----
+  for (let p = 0; p < 5; p++) {
+    const nextSel = 'a[aria-label="Next"], a.pagination__next, a[rel="next"]';
+    const nextLink = await page.$(nextSel);
+    if (!nextLink) break;
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 }),
+        nextLink.click(),
+      ]);
+      await autoScroll(page, 3);
+      await clickLoadMoreIfAny(page, 3);
+      const more = await collect();
+      const before = rows.length;
+      rows.push(...more);
+      if (rows.length === before) break;
+    } catch {}
+  }
+
+  rows = rows.map((r) => ({
+    ...r,
+    target,
+    species,
+    conjugate: ((m) => (m ? m[1].trim() : r.product_name))(/\)\s*(.*)$/.exec(r.product_name)),
+  }));
+
+  return rows;
+}
+
+async function scrapeBioLegend(page, target, species, laser) {
+  // Stealth + UA
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+  await page.setViewportSize({ width: 1366, height: 900 });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+  });
+
+  const tryUrls = getBioLegendUrls(target, species, laser);
+  let anchors = [];
+  let tried = [];
+  let pageCount = 0;
+
+  const collectAnchors = async () => {
+    // Primary structure
+    let arr = await page.$$eval("li.row.list h2 a[itemprop='name']", (els) =>
+      els.map((a) => {
+        const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+        let href = a.getAttribute("href") || "";
+        if (href && !/^https?:\/\//i.test(href)) {
+          href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+        }
+        return { name, href };
+      })
+    );
+    if (arr.length) return arr;
+
+    // Fallbacks
+    arr = await page.$$eval("li.row.list a[itemprop='name']", (els) =>
+      els.map((a) => {
+        const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+        let href = a.getAttribute("href") || "";
+        if (href && !/^https?:\/\//i.test(href)) {
+          href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+        }
+        return { name, href };
+      })
+    );
+    if (arr.length) return arr;
+
+    arr = await page.$$eval("a[href*='/products/']", (els) =>
+      els
+        .map((a) => {
+          const name = (a.textContent || "").trim().replace(/\s+/g, " ");
+          let href = a.getAttribute("href") || "";
+          if (href && !/^https?:\/\//i.test(href)) {
+            href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+          }
+          return { name, href };
+        })
+        .filter((x) => x.name && /biolegend\.com/i.test(x.href))
+    );
+    return arr;
+  };
+
+  const fetchMorePagesIfAny = async (currentUrl, have, maxPages = 5) => {
+    const out = [...have];
+    try {
+      const urlObj = new URL(currentUrl);
+      if (!urlObj.searchParams.get("PageSize")) urlObj.searchParams.set("PageSize", "100");
+      for (let p = 2; p <= maxPages; p++) {
+        urlObj.searchParams.set("Page", String(p));
+        const nextUrl = urlObj.toString();
+
+        await page.goto(nextUrl, { waitUntil: "networkidle", timeout: 60000 });
+        await acceptCookies(page);
+        await page.waitForTimeout(500);
+        await autoScroll(page, 3);
+        pageCount++;
+
+        const more = await collectAnchors();
+        if (!more || more.length === 0) break;
+        const before = out.length;
+        out.push(...more);
+        if (out.length === before) break;
+      }
+    } catch {}
+    return out;
+  };
+
+  for (const url of tryUrls) {
+    tried.push(url);
+    await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+    await acceptCookies(page);
+    await page.waitForTimeout(700);
+    await autoScroll(page, 5);
+    pageCount++;
+
+    anchors = await collectAnchors();
+    if (anchors && anchors.length) {
+      anchors = await fetchMorePagesIfAny(url, anchors, 5);
+      break;
+    }
+  }
+
+  const rows = (anchors || []).map(({ name, href }) => {
+    let conjugate = name;
+    const idx = name.toLowerCase().indexOf(" anti-");
+    if (idx > 0) conjugate = name.slice(0, idx).trim();
+    return {
+      vendor: "BioLegend",
+      product_name: name,
+      target,
+      species,
+      conjugate,
+      link: href,
+    };
+  });
+
+  return { rows, debug: { tried, pageCount, rowsFound: rows.length } };
+}
+
+/* ---------------------------------- Route(s) --------------------------------- */
+app.get("/search", async (req, res) => {
+  const vendorIn = req.query.vendor || "";
+  const target = (req.query.target || "").trim();
+  const species = (req.query.species || "Human").trim();
+  const laserIn = req.query.laser || "";
+  const override = req.query.override_url || "";
+  const debugWanted = (req.query.debug || "") === "1";
+
+  const vendor = normVendor(vendorIn);
+  const laser = normLaser(laserIn);
+
+  if (!vendor || !target || !species || !laser) {
+    return res.status(400).json({ error: "bad_params" });
+  }
+
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    headless: true,
+  });
+  const page = await browser.newPage({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  });
+
+  const domainOK = (v) =>
+    v === "BioLegend" ? "biolegend.com" : v === "Thermo Fisher" ? "thermofisher.com" : "bdbiosciences.com";
+
+  try {
+    let payload;
+    if (vendor === "all") {
+      // Run each vendor sequentially (simpler on free tiers)
+      const thermoUrl = URL_MAP.thermo[laser](target, species);
+      const bdUrl = URL_MAP.bd[laser](target, species);
+
+      const thermoRows = await scrapeThermo(page, thermoUrl, target, species).catch(() => []);
+      const bdRows = await scrapeBD(page, bdUrl, target, species).catch(() => []);
+      const bl = await scrapeBioLegend(page, target, species, laser).catch(() => ({ rows: [], debug: {} }));
+
+      let rows = [...thermoRows, ...bdRows, ...bl.rows];
+
+      // dedupe
+      const seen = new Set();
+      const final = [];
+      for (const r of rows) {
+        if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
+        const key = `${r.vendor}|${r.product_name}|${r.link}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        final.push(r);
+      }
+      payload = debugWanted
+        ? { rows: final, debug: { thermoUrl, bdUrl, bioLegend: bl.debug } }
+        : { rows: final };
+    } else if (vendor === "thermo") {
+      const startUrl = override || URL_MAP.thermo[laser](target, species);
+      const rows = await scrapeThermo(page, startUrl, target, species);
+      payload = debugWanted ? { url: startUrl, rows } : { rows };
+    } else if (vendor === "bd") {
+      const startUrl = override || URL_MAP.bd[laser](target, species);
+      const rows = await scrapeBD(page, startUrl, target, species);
+      payload = debugWanted ? { url: startUrl, rows } : { rows };
+    } else {
+      // biolegend
+      const bl = await scrapeBioLegend(page, target, species, laser);
+      payload = debugWanted ? { rows: bl.rows, debug: bl.debug } : { rows: bl.rows };
     }
 
-    // Domain guard + dedupe
-    const domainOK = (v) =>
-      v === "BioLegend"
-        ? "biolegend.com"
-        : v === "Thermo Fisher"
-        ? "thermofisher.com"
-        : "bdbiosciences.com";
-    const seen = new Set();
-    const final = [];
-    for (const r of rows) {
-      if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
-      const key = `${r.vendor}|${r.product_name}|${r.link}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      final.push(r);
-}  // end of vendor logic
-
-const debug = (req.query.debug || "") === "1";
-if (debug) {
-  return res.json({
-    url: startUrl,
-    rows: final,
-    debug: req._debug_vendor || null
-  });
-}
-return res.json({ rows: final });
-
-} catch (e) {
-  res
-    .status(502)
-    .json({ error: "fetch_or_parse_failed", detail: String(e) });
-} finally {
-  await browser.close();
-}
+    return res.json(payload);
+  } catch (e) {
+    return res.status(502).json({ error: "fetch_or_parse_failed", detail: String(e) });
+  } finally {
+    await browser.close();
+  }
 });
 
+/* ------------------------------ Simple HTML table --------------------------- */
+app.get("/table", async (req, res) => {
+  const qs = new URLSearchParams({
+    vendor: String(req.query.vendor || ""),
+    target: String(req.query.target || ""),
+    species: String(req.query.species || ""),
+    laser: String(req.query.laser || ""),
+  });
+  const base = `${req.protocol}://${req.get("host")}`;
+  const url = `${base}/search?${qs.toString()}`;
+
+  try {
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const table =
+      `<table border="1" cellpadding="6" cellspacing="0">
+        <thead>
+          <tr><th>Vendor</th><th>Product Name</th><th>Target</th><th>Species</th><th>Conjugate</th><th>Link</th></tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (r) =>
+                `<tr>
+                  <td>${r.vendor || ""}</td>
+                  <td>${r.product_name || ""}</td>
+                  <td>${r.target || ""}</td>
+                  <td>${r.species || ""}</td>
+                  <td>${r.conjugate || ""}</td>
+                  <td><a href="${r.link || "#"}" target="_blank">Product</a></td>
+                </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>`;
+
+    res.type("text/html").send(
+      `<h3>Results for ${req.query.vendor || ""} / ${req.query.target || ""} / ${
+        req.query.species || ""
+      } / ${req.query.laser || ""}</h3>${table}`
+    );
+  } catch (e) {
+    res.status(500).type("text/plain").send("Failed to render table: " + String(e));
+  }
+});
+
+/* --------------------------------- Boot --------------------------------- */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log("Playwright API listening on " + PORT)
-);
+app.listen(PORT, () => console.log("Playwright API listening on " + PORT));
+
 
 
 
