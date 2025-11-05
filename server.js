@@ -22,20 +22,20 @@ const normVendor = (v) =>
     ? "bd"
     : null;
 
-const normLaser = (l) =>
-  (
-    {
-      uv: "uv",
-      violet: "violet",
-      blue: "blue",
-      yg: "yg",
-      yellow: "yg",
-      "yellow-green": "yg",
-      "yellow green": "yg",
-      green: "yg",
-      red: "red",
-    } as Record<string, string>
-  )[l] || null;
+const normLaser = (l) => {
+  const map = {
+    uv: "uv",
+    violet: "violet",
+    blue: "blue",
+    yg: "yg",
+    yellow: "yg",
+    "yellow-green": "yg",
+    "yellow green": "yg",
+    green: "yg",
+    red: "red",
+  };
+  return map[l] || null;
+};
 
 const acceptCookies = async (page) => {
   const selectors = [
@@ -220,8 +220,7 @@ app.get("/search", async (req, res) => {
     return res.status(400).json({ error: "bad_params" });
   }
 
-  const startUrl =
-    override || URL_MAP[vendor][laser](target, species);
+  const startUrl = override || URL_MAP[vendor][laser](target, species);
 
   const browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -267,7 +266,6 @@ app.get("/search", async (req, res) => {
             if (name && href && href.includes("biolegend.com")) {
               return { vendor: "BioLegend", product_name: name, link: href };
             }
-            // Fallback by data attributes if anchor missing text
             const alt =
               card.querySelector("[data-product-name], [title]") || null;
             if (alt) {
@@ -435,6 +433,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log("Playwright API listening on " + PORT)
 );
-
-
-
