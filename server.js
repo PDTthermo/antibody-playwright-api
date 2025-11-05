@@ -502,15 +502,23 @@ app.get("/search", async (req, res) => {
       let rows = [...thermoRows, ...bdRows, ...bl.rows];
 
       // dedupe
-      const seen = new Set();
-      const final = [];
-      for (const r of rows) {
-        if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
-        const key = `${r.vendor}|${r.product_name}|${r.link}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        final.push(r);
-      }
+     const domainOK = (v) =>
+  v === "BioLegend"
+    ? "biolegend.com"
+    : v === "Thermo Fisher"
+    ? "thermofisher.com"
+    : "bdbiosciences.com";
+
+// remove exact duplicates and near duplicates (same target + conjugate + vendor)
+const seen = new Set();
+const final = [];
+for (const r of rows) {
+  if (!r.link || !r.link.includes(domainOK(r.vendor))) continue;
+  const key = `${r.vendor}|${r.target}|${r.conjugate}|${r.product_name.replace(/\s+/g, " ")}`;
+  if (seen.has(key)) continue;
+  seen.add(key);
+  final.push(r);
+}
       payload = debugWanted
         ? { rows: final, debug: { thermoUrl, bdUrl, bioLegend: bl.debug } }
         : { rows: final };
@@ -550,35 +558,49 @@ app.get("/table", async (req, res) => {
   try {
     const resp = await fetch(url);
     const data = await resp.json();
-
     const rows = Array.isArray(data.rows) ? data.rows : [];
-    const table =
-      `<table border="1" cellpadding="6" cellspacing="0">
+
+    // Group by vendor
+    const grouped = {};
+    for (const r of rows) {
+      const v = r.vendor || "Unknown Vendor";
+      if (!grouped[v]) grouped[v] = [];
+      grouped[v].push(r);
+    }
+
+    let html = `<h2>Results for ${req.query.target} (${req.query.laser})</h2>`;
+    for (const [vendor, list] of Object.entries(grouped)) {
+      html += `<h3>${vendor} (${list.length} results)</h3>
+      <table border="1" cellpadding="6" cellspacing="0" style="margin-bottom:20px;">
         <thead>
-          <tr><th>Vendor</th><th>Product Name</th><th>Target</th><th>Species</th><th>Conjugate</th><th>Link</th></tr>
+          <tr>
+            <th>#</th>
+            <th>Product Name</th>
+            <th>Target</th>
+            <th>Species</th>
+            <th>Conjugate</th>
+            <th>Link</th>
+          </tr>
         </thead>
         <tbody>
-          ${rows
+          ${list
             .map(
-              (r) =>
+              (r, i) =>
                 `<tr>
-                  <td>${r.vendor || ""}</td>
+                  <td>${i + 1}</td>
                   <td>${r.product_name || ""}</td>
                   <td>${r.target || ""}</td>
                   <td>${r.species || ""}</td>
                   <td>${r.conjugate || ""}</td>
-                  <td><a href="${r.link || "#"}" target="_blank">Product</a></td>
+                  <td><a href="${r.link}" target="_blank">View</a></td>
                 </tr>`
             )
             .join("")}
         </tbody>
       </table>`;
+    }
 
-    res.type("text/html").send(
-      `<h3>Results for ${req.query.vendor || ""} / ${req.query.target || ""} / ${
-        req.query.species || ""
-      } / ${req.query.laser || ""}</h3>${table}`
-    );
+    res.type("text/html").send(html);
   } catch (e) {
     res.status(500).type("text/plain").send("Failed to render table: " + String(e));
   }
@@ -587,6 +609,7 @@ app.get("/table", async (req, res) => {
 /* --------------------------------- Boot --------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Playwright API listening on " + PORT));
+
 
 
 
