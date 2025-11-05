@@ -248,56 +248,64 @@ app.get("/search", async (req, res) => {
     let rows = [];
 
     // ------------ BIOLEGEND ------------
-    if (vendor === "biolegend") {
-      const cardsSel =
-        "div.product-cell, .c-product-card, article.c-product-card, .c-search-results__products .c-product-card";
-      await page.waitForSelector(cardsSel, { timeout: 12000 }).catch(() => {});
-      rows = await page.$$eval(cardsSel, (cards) =>
-        cards
-          .map((card) => {
-            const a =
-              card.querySelector(
-                'a[itemprop="name"], a.c-product-card__title, a.product-name, a.product-title, a.card-title, a[href*="/products/"]'
-              ) || null;
-            const name = a ? a.textContent.trim().replace(/\s+/g, " ") : null;
-            let href = a ? a.getAttribute("href") : null;
-            if (href && !href.startsWith("http"))
-              href = "https://www.biolegend.com" + href;
-            if (name && href && href.includes("biolegend.com")) {
-              return { vendor: "BioLegend", product_name: name, link: href };
-            }
-            const alt =
-              card.querySelector("[data-product-name], [title]") || null;
-            if (alt) {
-              const txt =
-                alt.getAttribute("data-product-name") ||
-                alt.getAttribute("title") ||
-                "";
-              if (txt.trim() && href && href.includes("biolegend.com")) {
-                return {
-                  vendor: "BioLegend",
-                  product_name: txt.trim(),
-                  link: href,
-                };
-              }
-            }
-            return null;
-          })
-          .filter(Boolean)
-      );
+    // ------------ BIOLEGEND ------------
+if (vendor === "biolegend") {
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => {});
+    await acceptCookies(page);
+    await page.waitForTimeout(800);
+    await autoScroll(page, 6);
 
-      rows = rows.map((r) => ({
-        ...r,
-        target,
-        species,
-        conjugate: (() => {
-          const i = r.product_name.toLowerCase().indexOf(" anti-");
-          if (i > 0) return r.product_name.slice(0, i).trim();
-          const parts = r.product_name.split(",");
-          return parts.length > 1 ? parts[parts.length - 1].trim() : r.product_name;
-        })(),
-      }));
-    }
+    // Each product is inside <li class="row list"> with <h2><a itemprop="name">
+    const cardsSel = "li.row.list";
+    await page.waitForSelector(cardsSel, { timeout: 15000 }).catch(() => {});
+
+    // In case “Load more” exists
+    await clickLoadMoreIfAny(page, 5);
+    await autoScroll(page, 2);
+
+    rows = await page.$$eval(cardsSel, (cards) => {
+      return Array.from(cards)
+        .map((card) => {
+          const a = card.querySelector("h2 a[itemprop='name'], a[itemprop='name']");
+          if (!a) return null;
+
+          const name = a.textContent ? a.textContent.trim().replace(/\s+/g, " ") : null;
+          let href = a.getAttribute("href") || "";
+          if (href && !/^https?:\/\//i.test(href)) {
+            href = "https://www.biolegend.com" + (href.startsWith("/") ? href : "/" + href);
+          }
+          if (!name || !href.includes("biolegend.com")) return null;
+
+          // Extract conjugate from part before "anti-" if possible
+          let conjugate = name;
+          const idx = name.toLowerCase().indexOf(" anti-");
+          if (idx > 0) conjugate = name.slice(0, idx).trim();
+
+          return {
+            vendor: "BioLegend",
+            product_name: name,
+            target: null,
+            species: null,
+            conjugate: conjugate,
+            link: href
+          };
+        })
+        .filter(Boolean);
+    });
+
+    // Fill target/species from query
+    rows = rows.map((r) => ({
+      ...r,
+      target: target,
+      species: species
+    }));
+
+  } catch (err) {
+    console.error("BioLegend scrape failed:", err);
+    rows = [];
+  }
+}
 
     // ------------ THERMO (WORKING) ------------
     if (vendor === "thermo") {
@@ -433,3 +441,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log("Playwright API listening on " + PORT)
 );
+
