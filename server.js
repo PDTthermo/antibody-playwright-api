@@ -315,7 +315,7 @@ const URL_MAP = {
         target
       )}/filter/application/Flow+Cytometry/species/${encodeURIComponent(
         species
-      )}/compatibility/355+nm+(UV)`,
+      )}/compatibility/355+nm+(Ultraviolet)`,
     violet: (target, species) =>
       `https://www.thermofisher.com/antibody/primary/query/${encodeURIComponent(
         target
@@ -667,3 +667,4 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log("Playwright API listening on " + PORT);
 });
+
